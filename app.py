@@ -196,6 +196,34 @@ def find_operating_point(q_arr, ipr_arr, tpr_arr):
     return None, None
 
 
+def gilbert_choke_pwh(q_arr, GLR_Mscf, S_64):
+    """
+    Gilbert (1954) surface-choke correlation — wellhead pressure
+    (psi) required for CRITICAL (sonic) flow through a bean:
+
+        P_wh = 435 · R^0.546 · q / S^1.89
+
+    R = GLR (Mscf/STB), q = liquid rate (STB/d), S = bean size (1/64 in).
+    """
+    R = max(GLR_Mscf, 1e-6)
+    return (435.0 * R ** 0.546 * np.asarray(q_arr, dtype=float)) / (S_64 ** 1.89)
+
+
+def find_wellhead_point(q_arr, pwh_avail, pwh_choke):
+    """
+    Wellhead-node operating point: where available wellhead pressure
+    (reservoir through tubing) meets the choke demand curve.
+    """
+    diff = pwh_avail - pwh_choke
+    for i in range(len(diff) - 1):
+        if diff[i] > 0 and diff[i + 1] <= 0:
+            frac = diff[i] / (diff[i] - diff[i + 1])
+            op_q   = q_arr[i]    + frac * (q_arr[i + 1]    - q_arr[i])
+            op_pwh = pwh_choke[i] + frac * (pwh_choke[i + 1] - pwh_choke[i])
+            return op_q, op_pwh
+    return None, None
+
+
 # ═══════════════════════════════════════════════════════════════
 #  SIDEBAR — INPUT PARAMETERS
 # ═══════════════════════════════════════════════════════════════
@@ -246,6 +274,14 @@ with st.sidebar:
     Pwh   = st.number_input("Wellhead Pressure (psia)",       value=150,  min_value=15,  step=10)
     T_res = st.number_input("Reservoir Temperature (°F)",     value=180,  min_value=60,  step=5)
     T_surf= st.number_input("Surface Temperature (°F)",       value=80,   min_value=32,  step=5)
+
+    st.divider()
+
+    # ── Surface Choke (Gilbert) ────────────────────────────────
+    st.markdown("### 🎚 Surface Choke (Gilbert)")
+    enable_choke = st.checkbox("Enable wellhead choke analysis", value=True)
+    if enable_choke:
+        choke_S = st.number_input("Choke / Bean Size (1/64 in)", value=32, min_value=4, max_value=128, step=2)
 
     st.divider()
     st.markdown("🟢 **Live** — results update as you edit.")
@@ -407,6 +443,85 @@ fig.update_layout(
 
 st.plotly_chart(fig, use_container_width=True)
 
+# ── Surface Choke / Wellhead-Node Analysis (Gilbert) ───────────
+
+if enable_choke:
+    st.divider()
+    st.markdown("### 🎚 Wellhead-Node Analysis — Gilbert Choke")
+
+    # GLR (Mscf/STB) from solution GOR and water cut
+    GLR_Mscf = (1 - WC) * GOR / 1000.0
+
+    # Available wellhead pressure from reservoir through tubing:
+    #   Pwh_avail(q) = Pwf_IPR(q) − ΔP_tubing(q),   ΔP_tubing = TPR(q) − Pwh
+    dP_tubing = tpr_arr - Pwh
+    pwh_avail = np.maximum(0, ipr_arr - dP_tubing)
+
+    # Choke demand for the selected bean
+    pwh_sel = gilbert_choke_pwh(q_arr, GLR_Mscf, choke_S)
+    ck_q, ck_pwh = find_wellhead_point(q_arr, pwh_avail, pwh_sel)
+
+    # Result cards
+    k1, k2, k3 = st.columns(3)
+    with k1:
+        if ck_q:
+            st.metric("Choked Operating Rate", f"{int(round(ck_q)):,} STB/d",
+                      help="Where available wellhead pressure meets the Gilbert choke demand.")
+        else:
+            st.metric("Choked Operating Rate", "No Intersection")
+    with k2:
+        st.metric("Wellhead Pressure", f"{int(round(ck_pwh)):,} psia" if ck_pwh else "—")
+    with k3:
+        st.metric("Bean Size", f"{int(choke_S)}/64 in",
+                  help=f"GLR used: {GLR_Mscf:.3f} Mscf/STB")
+
+    # Chart: available-Pwh curve + choke family + selected bean + op point
+    figc = go.Figure()
+    figc.add_trace(go.Scatter(
+        x=q_arr, y=pwh_avail, mode="lines", name="Available Pwh (tubing)",
+        line=dict(color="#a78bfa", width=3),
+        hovertemplate="q = %{x:.0f} STB/d<br>Pwh = %{y:.0f} psia<extra>Available</extra>"
+    ))
+    bean_family = [16, 24, 32, 48, 64]
+    for S in bean_family:
+        if S == int(choke_S):
+            continue
+        figc.add_trace(go.Scatter(
+            x=q_arr, y=gilbert_choke_pwh(q_arr, GLR_Mscf, S),
+            mode="lines", name=f"{S}/64 in",
+            line=dict(color="#475569", width=1.3, dash="dot"),
+            hovertemplate=f"Bean {S}/64<br>"+"q = %{x:.0f}<br>Pwh = %{y:.0f} psia<extra></extra>"
+        ))
+    figc.add_trace(go.Scatter(
+        x=q_arr, y=pwh_sel, mode="lines", name=f"Choke {int(choke_S)}/64 in (selected)",
+        line=dict(color="#f59e0b", width=3),
+        hovertemplate=f"Bean {int(choke_S)}/64<br>"+"q = %{x:.0f}<br>Pwh = %{y:.0f} psia<extra>Choke</extra>"
+    ))
+    if ck_q and ck_pwh:
+        figc.add_trace(go.Scatter(
+            x=[ck_q], y=[ck_pwh], mode="markers+text", name="Choked Operating Point",
+            marker=dict(color="#4ade80", size=14, line=dict(color="#16a34a", width=2)),
+            text=[f"  ({int(round(ck_q)):,} STB/d, {int(round(ck_pwh)):,} psia)"],
+            textposition="middle right", textfont=dict(color="#4ade80", size=11),
+            hoverinfo="skip"
+        ))
+    figc.update_layout(
+        title=dict(text="<b>Available Wellhead Pressure vs Gilbert Choke Demand</b>",
+                   font=dict(color="#f8fafc", size=15)),
+        xaxis=dict(title="Liquid Flow Rate  q  (STB/d)", color="#94a3b8",
+                   gridcolor="#1e293b", zerolinecolor="#334155", title_font=dict(color="#94a3b8")),
+        yaxis=dict(title="Wellhead Pressure  Pwh  (psia)", color="#94a3b8",
+                   gridcolor="#1e293b", zerolinecolor="#334155", title_font=dict(color="#94a3b8")),
+        paper_bgcolor="#0d1117", plot_bgcolor="#070b13",
+        legend=dict(font=dict(color="#94a3b8"), bgcolor="#0d1117",
+                    bordercolor="#1e293b", borderwidth=1),
+        hovermode="closest", height=460
+    )
+    st.plotly_chart(figc, use_container_width=True)
+    st.caption("Gilbert's correlation assumes **critical (sonic) flow** across the bean — valid when "
+               "downstream pressure is below ≈ 0.5–0.7 × wellhead pressure. Larger beans pass more rate "
+               "at lower wellhead pressure.")
+
 # ── Equations Reference ────────────────────────────────────────
 
 st.divider()
@@ -431,6 +546,8 @@ with e2:
     st.latex(r"f = \frac{0.25}{\left[\log_{10}\!\left(\frac{\varepsilon/d}{3.7} + \frac{5.74}{Re^{0.9}}\right)\right]^2}")
 
 with e3:
+    st.markdown("**Gilbert Choke (1954)**")
+    st.latex(r"P_{wh} = \frac{435 \cdot R^{0.546} \cdot q_L}{S^{1.89}} \quad \text{[psi]}")
     st.markdown("**Gas FVF**")
     st.latex(r"B_g = \frac{0.00504 \cdot z \cdot T}{P} \quad \text{[res bbl/scf]}")
     st.markdown("**z-factor (Papay, 1985)**")
