@@ -225,6 +225,125 @@ def find_wellhead_point(q_arr, pwh_avail, pwh_choke):
 
 
 # ═══════════════════════════════════════════════════════════════
+#  VERTICAL LIFT PERFORMANCE — Gilbert pressure-traverse method
+#  Multiphase gradient integrated down/up the tubing (Beggs-Brill
+#  holdup + Jain friction). This is the computational equivalent of
+#  reading the Gilbert pressure-distribution curve by "equivalent
+#  depth": Method 1 (THP -> Pwf) and Method 2 (Pwf -> THP).
+# ═══════════════════════════════════════════════════════════════
+
+def jain_friction(Re, eD):
+    """Jain (1976) explicit friction factor:
+        1/sqrt(f) = 1.14 - 2 log(e/D + 21.25/Re^0.9)"""
+    Re = max(Re, 1.0e3)
+    inv = 1.14 - 2.0 * np.log10(eD + 21.25 / Re ** 0.9)
+    return 1.0 / inv ** 2
+
+
+def bb_gradient(P, T_R, q, vp):
+    """Beggs & Brill (1973) two-phase pressure gradient (psi/ft) for
+    upward vertical flow, acceleration term neglected (sinθ = 1)."""
+    d  = vp["d_in"] / 12.0
+    A  = np.pi / 4.0 * d * d
+    sg_oil = 141.5 / (vp["API"] + 131.5)
+    rho_L  = 62.4 * (sg_oil * (1 - vp["WC"]) / vp["Bo"] + vp["SG_water"] * vp["WC"])
+
+    z   = z_factor(P, T_R, vp["SG_gas"])
+    Bg  = 0.0283 * z * T_R / P                      # ft³/scf
+    rho_g = vp["SG_gas"] * 28.97 * P / (10.732 * T_R * z)
+
+    q_oil = q * (1 - vp["WC"])
+    qL = (q_oil * vp["Bo"] + q * vp["WC"]) * 5.615 / 86400.0   # ft³/s
+    qg = q_oil * vp["GOR"] * Bg / 86400.0                      # ft³/s
+    qt = qL + qg
+    if qt <= 0:
+        return rho_L / 144.0
+
+    vsL = qL / A; vsg = qg / A; vm = vsL + vsg
+    lamL = min(max(vsL / vm, 1e-6), 1.0)
+    Nfr  = vm * vm / (32.174 * d)
+    NLv  = 1.938 * vsL * (rho_L / max(vp["sigma"], 1e-3)) ** 0.25
+
+    L1 = 316 * lamL ** 0.302
+    L2 = 0.0009252 * lamL ** (-2.4684)
+    L3 = 0.10 * lamL ** (-1.4516)
+    L4 = 0.5 * lamL ** (-6.738)
+
+    if (lamL < 0.01 and Nfr < L1) or (lamL >= 0.01 and Nfr < L2):
+        regime = "seg"
+    elif lamL >= 0.01 and L2 <= Nfr <= L3:
+        regime = "trans"
+    elif (0.01 <= lamL < 0.4 and L3 < Nfr <= L1) or (lamL >= 0.4 and L3 < Nfr <= L4):
+        regime = "int"
+    else:
+        regime = "dist"
+
+    def HL0(rg):
+        a, b, c = {"seg": (0.98, 0.4846, 0.0868),
+                   "int": (0.845, 0.5351, 0.0173),
+                   "dist": (1.065, 0.5824, 0.0609)}[rg]
+        return max(a * lamL ** b / Nfr ** c, lamL)
+
+    def HL_incl(rg, h0):
+        if rg == "dist":
+            return min(max(h0, lamL), 1.0)
+        e, f, g_, h = {"seg": (0.011, -3.768, 3.539, -1.614),
+                       "int": (2.96, 0.305, -0.4473, 0.0978)}[rg]
+        C = (1 - lamL) * np.log(max(e * lamL ** f * NLv ** g_ * Nfr ** h, 1e-9))
+        C = max(C, 0.0)
+        th = np.radians(90.0)
+        psi = 1 + C * (np.sin(1.8 * th) - 0.333 * np.sin(1.8 * th) ** 3)
+        return min(max(h0 * psi, lamL), 1.0)
+
+    if regime == "trans":
+        Ai = (L3 - Nfr) / (L3 - L2)
+        HL = Ai * HL_incl("seg", HL0("seg")) + (1 - Ai) * HL_incl("int", HL0("int"))
+    else:
+        HL = HL_incl(regime, HL0(regime))
+    HL = min(max(HL, lamL), 1.0)
+
+    rho_s = rho_L * HL + rho_g * (1 - HL)
+    rho_n = rho_L * lamL + rho_g * (1 - lamL)
+    mu_n  = vp["muL"] * lamL + vp["mug"] * (1 - lamL)
+    Re    = 1488 * rho_n * vm * d / max(mu_n, 1e-4)
+    fn    = jain_friction(Re, vp["eD"])
+
+    y = lamL / HL ** 2
+    if 1.0 < y < 1.2:
+        S = np.log(2.2 * y - 1.2)
+    else:
+        ly = np.log(max(y, 1e-6))
+        S = ly / (-0.0523 + 3.182 * ly - 0.8725 * ly ** 2 + 0.01853 * ly ** 4)
+    ftp = fn * np.exp(np.clip(S, -5, 5))
+
+    grav = rho_s / 144.0
+    fric = ftp * rho_n * vm * vm / (2 * 32.174 * d) / 144.0
+    return grav + fric
+
+
+def integrate_traverse(P0, q, vp, direction, n_steps=80, record=False):
+    """March the pressure gradient along the tubing.
+    direction +1 = downward (THP→Pwf, Method 1),
+    direction -1 = upward   (Pwf→THP, Method 2)."""
+    dL = vp["depth"] / n_steps
+    P  = float(P0)
+    T_top = vp["Tsurf"] + 460.0
+    T_bot = vp["Tres"] + 460.0
+    depths, pres = [0.0 if direction > 0 else vp["depth"]], [P]
+    for i in range(n_steps):
+        L = (i + 0.5) * dL if direction > 0 else vp["depth"] - (i + 0.5) * dL
+        T_R = T_top + (T_bot - T_top) * (L / vp["depth"])
+        g = bb_gradient(max(P, 20.0), T_R, q, vp)
+        P = max(P + direction * g * dL, 15.0)
+        if record:
+            md = (i + 1) * dL if direction > 0 else vp["depth"] - (i + 1) * dL
+            depths.append(md); pres.append(P)
+    if record:
+        return np.array(depths), np.array(pres)
+    return P
+
+
+# ═══════════════════════════════════════════════════════════════
 #  SIDEBAR — INPUT PARAMETERS
 # ═══════════════════════════════════════════════════════════════
 
@@ -284,6 +403,13 @@ with st.sidebar:
         choke_S = st.number_input("Choke / Bean Size (1/64 in)", value=32, min_value=4, max_value=128, step=2)
 
     st.divider()
+    with st.expander("🌀 VLP / Multiphase properties"):
+        muL   = st.number_input("Liquid viscosity, μL (cP)", value=2.0,  min_value=0.1, step=0.1, format="%.2f")
+        mug   = st.number_input("Gas viscosity, μg (cP)",     value=0.018, min_value=0.001, step=0.001, format="%.3f")
+        sigma = st.number_input("Liquid surface tension (dyne/cm)", value=30.0, min_value=1.0, step=1.0)
+        rough = st.number_input("Tubing roughness, e (ft)",   value=0.00006, min_value=0.0, step=0.00001, format="%.5f")
+
+    st.divider()
     st.markdown("🟢 **Live** — results update as you edit.")
 
 
@@ -331,229 +457,365 @@ except Exception as e:
     st.error(f"Calculation error: {e}")
     st.stop()
 
-# ── Result Cards ───────────────────────────────────────────────
+# build VLP parameter dict (shared multiphase + well props)
+vp = dict(d_in=d_in, API=API, WC=WC, Bo=Bo, SG_water=SG_water, SG_gas=SG_gas,
+          GOR=GOR, Tres=T_res, Tsurf=T_surf, depth=H, muL=muL, mug=mug,
+          sigma=sigma, eD=rough / (d_in / 12.0))
 
-drawdown     = round(Pr - op_pwf, 0) if op_pwf else None
-drawdown_pct = round((drawdown / Pr) * 100, 1) if drawdown else None
+tab1, tab2 = st.tabs(["📊  Nodal Analysis (IPR vs TPR)",
+                      "🌀  Vertical Lift Performance — Gilbert Method"])
 
-c1, c2, c3, c4 = st.columns(4)
+with tab1:
+    # ── Result Cards ───────────────────────────────────────────────
 
-with c1:
-    st.metric(
-        label="AOF  (q_max)",
-        value=f"{int(round(qmax)):,} STB/d",
-        help="Absolute Open Flow — maximum possible rate if Pwf = 0"
-    )
-with c2:
-    if op_q:
+    drawdown     = round(Pr - op_pwf, 0) if op_pwf else None
+    drawdown_pct = round((drawdown / Pr) * 100, 1) if drawdown else None
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    with c1:
         st.metric(
-            label="Operating Rate",
-            value=f"{int(round(op_q)):,} STB/d",
-            delta=f"{round(op_q/qmax*100, 1)}% of AOF"
+            label="AOF  (q_max)",
+            value=f"{int(round(qmax)):,} STB/d",
+            help="Absolute Open Flow — maximum possible rate if Pwf = 0"
         )
-    else:
-        st.metric(label="Operating Rate", value="No Intersection")
-with c3:
-    if op_pwf:
-        st.metric(
-            label="Operating FBHP",
-            value=f"{int(round(op_pwf)):,} psia",
-            delta=f"Drawdown: {int(drawdown):,} psi ({drawdown_pct}%)",
-            delta_color="inverse"
-        )
-    else:
-        st.metric(label="Operating FBHP", value="—")
-with c4:
-    st.metric(label="IPR Method", value=ipr_model)
-
-st.divider()
-
-# ── Chart ──────────────────────────────────────────────────────
-
-fig = go.Figure()
-
-# IPR curve
-fig.add_trace(go.Scatter(
-    x=q_arr, y=ipr_arr,
-    mode="lines",
-    name="IPR Curve",
-    line=dict(color="#60a5fa", width=3),
-    hovertemplate="q = %{x:.0f} STB/d<br>Pwf = %{y:.0f} psia<extra>IPR</extra>"
-))
-
-# TPR curve
-fig.add_trace(go.Scatter(
-    x=q_arr, y=tpr_arr,
-    mode="lines",
-    name="TPR Curve",
-    line=dict(color="#f59e0b", width=3),
-    hovertemplate="q = %{x:.0f} STB/d<br>Pwf = %{y:.0f} psia<extra>TPR</extra>"
-))
-
-# Operating point
-if op_q and op_pwf:
-    fig.add_trace(go.Scatter(
-        x=[op_q], y=[op_pwf],
-        mode="markers+text",
-        name="Operating Point",
-        marker=dict(color="#4ade80", size=14, symbol="circle",
-                    line=dict(color="#16a34a", width=2)),
-        text=[f"  ({int(round(op_q)):,} STB/d, {int(round(op_pwf)):,} psia)"],
-        textposition="middle right",
-        textfont=dict(color="#4ade80", size=11),
-        hovertemplate=(
-            f"Operating Point<br>"
-            f"q = {int(round(op_q)):,} STB/d<br>"
-            f"Pwf = {int(round(op_pwf)):,} psia"
-            "<extra></extra>"
-        )
-    ))
-
-# Layout
-fig.update_layout(
-    title=dict(
-        text="<b>Well Performance Curves — IPR vs TPR</b>",
-        font=dict(color="#f8fafc", size=16)
-    ),
-    xaxis=dict(
-        title="Liquid Flow Rate  q  (STB/d)",
-        color="#94a3b8",
-        gridcolor="#1e293b",
-        zerolinecolor="#334155",
-        title_font=dict(color="#94a3b8")
-    ),
-    yaxis=dict(
-        title="Flowing BHP  Pwf  (psia)",
-        color="#94a3b8",
-        gridcolor="#1e293b",
-        zerolinecolor="#334155",
-        title_font=dict(color="#94a3b8")
-    ),
-    paper_bgcolor="#0d1117",
-    plot_bgcolor="#070b13",
-    legend=dict(
-        font=dict(color="#94a3b8"),
-        bgcolor="#0d1117",
-        bordercolor="#1e293b",
-        borderwidth=1
-    ),
-    hovermode="x unified",
-    height=480
-)
-
-st.plotly_chart(fig, use_container_width=True)
-
-# ── Surface Choke / Wellhead-Node Analysis (Gilbert) ───────────
-
-if enable_choke:
-    st.divider()
-    st.markdown("### 🎚 Wellhead-Node Analysis — Gilbert Choke")
-
-    # GLR (Mscf/STB) from solution GOR and water cut
-    GLR_Mscf = (1 - WC) * GOR / 1000.0
-
-    # Available wellhead pressure from reservoir through tubing:
-    #   Pwh_avail(q) = Pwf_IPR(q) − ΔP_tubing(q),   ΔP_tubing = TPR(q) − Pwh
-    dP_tubing = tpr_arr - Pwh
-    pwh_avail = np.maximum(0, ipr_arr - dP_tubing)
-
-    # Choke demand for the selected bean
-    pwh_sel = gilbert_choke_pwh(q_arr, GLR_Mscf, choke_S)
-    ck_q, ck_pwh = find_wellhead_point(q_arr, pwh_avail, pwh_sel)
-
-    # Result cards
-    k1, k2, k3 = st.columns(3)
-    with k1:
-        if ck_q:
-            st.metric("Choked Operating Rate", f"{int(round(ck_q)):,} STB/d",
-                      help="Where available wellhead pressure meets the Gilbert choke demand.")
+    with c2:
+        if op_q:
+            st.metric(
+                label="Operating Rate",
+                value=f"{int(round(op_q)):,} STB/d",
+                delta=f"{round(op_q/qmax*100, 1)}% of AOF"
+            )
         else:
-            st.metric("Choked Operating Rate", "No Intersection")
-    with k2:
-        st.metric("Wellhead Pressure", f"{int(round(ck_pwh)):,} psia" if ck_pwh else "—")
-    with k3:
-        st.metric("Bean Size", f"{int(choke_S)}/64 in",
-                  help=f"GLR used: {GLR_Mscf:.3f} Mscf/STB")
+            st.metric(label="Operating Rate", value="No Intersection")
+    with c3:
+        if op_pwf:
+            st.metric(
+                label="Operating FBHP",
+                value=f"{int(round(op_pwf)):,} psia",
+                delta=f"Drawdown: {int(drawdown):,} psi ({drawdown_pct}%)",
+                delta_color="inverse"
+            )
+        else:
+            st.metric(label="Operating FBHP", value="—")
+    with c4:
+        st.metric(label="IPR Method", value=ipr_model)
 
-    # Chart: available-Pwh curve + choke family + selected bean + op point
-    figc = go.Figure()
-    figc.add_trace(go.Scatter(
-        x=q_arr, y=pwh_avail, mode="lines", name="Available Pwh (tubing)",
-        line=dict(color="#a78bfa", width=3),
-        hovertemplate="q = %{x:.0f} STB/d<br>Pwh = %{y:.0f} psia<extra>Available</extra>"
+    st.divider()
+
+    # ── Chart ──────────────────────────────────────────────────────
+
+    fig = go.Figure()
+
+    # IPR curve
+    fig.add_trace(go.Scatter(
+        x=q_arr, y=ipr_arr,
+        mode="lines",
+        name="IPR Curve",
+        line=dict(color="#60a5fa", width=3),
+        hovertemplate="q = %{x:.0f} STB/d<br>Pwf = %{y:.0f} psia<extra>IPR</extra>"
     ))
-    bean_family = [16, 24, 32, 48, 64]
-    for S in bean_family:
-        if S == int(choke_S):
-            continue
-        figc.add_trace(go.Scatter(
-            x=q_arr, y=gilbert_choke_pwh(q_arr, GLR_Mscf, S),
-            mode="lines", name=f"{S}/64 in",
-            line=dict(color="#475569", width=1.3, dash="dot"),
-            hovertemplate=f"Bean {S}/64<br>"+"q = %{x:.0f}<br>Pwh = %{y:.0f} psia<extra></extra>"
-        ))
-    figc.add_trace(go.Scatter(
-        x=q_arr, y=pwh_sel, mode="lines", name=f"Choke {int(choke_S)}/64 in (selected)",
+
+    # TPR curve
+    fig.add_trace(go.Scatter(
+        x=q_arr, y=tpr_arr,
+        mode="lines",
+        name="TPR Curve",
         line=dict(color="#f59e0b", width=3),
-        hovertemplate=f"Bean {int(choke_S)}/64<br>"+"q = %{x:.0f}<br>Pwh = %{y:.0f} psia<extra>Choke</extra>"
+        hovertemplate="q = %{x:.0f} STB/d<br>Pwf = %{y:.0f} psia<extra>TPR</extra>"
     ))
-    if ck_q and ck_pwh:
-        figc.add_trace(go.Scatter(
-            x=[ck_q], y=[ck_pwh], mode="markers+text", name="Choked Operating Point",
-            marker=dict(color="#4ade80", size=14, line=dict(color="#16a34a", width=2)),
-            text=[f"  ({int(round(ck_q)):,} STB/d, {int(round(ck_pwh)):,} psia)"],
-            textposition="middle right", textfont=dict(color="#4ade80", size=11),
-            hoverinfo="skip"
+
+    # Operating point
+    if op_q and op_pwf:
+        fig.add_trace(go.Scatter(
+            x=[op_q], y=[op_pwf],
+            mode="markers+text",
+            name="Operating Point",
+            marker=dict(color="#4ade80", size=14, symbol="circle",
+                        line=dict(color="#16a34a", width=2)),
+            text=[f"  ({int(round(op_q)):,} STB/d, {int(round(op_pwf)):,} psia)"],
+            textposition="middle right",
+            textfont=dict(color="#4ade80", size=11),
+            hovertemplate=(
+                f"Operating Point<br>"
+                f"q = {int(round(op_q)):,} STB/d<br>"
+                f"Pwf = {int(round(op_pwf)):,} psia"
+                "<extra></extra>"
+            )
         ))
-    figc.update_layout(
-        title=dict(text="<b>Available Wellhead Pressure vs Gilbert Choke Demand</b>",
-                   font=dict(color="#f8fafc", size=15)),
-        xaxis=dict(title="Liquid Flow Rate  q  (STB/d)", color="#94a3b8",
-                   gridcolor="#1e293b", zerolinecolor="#334155", title_font=dict(color="#94a3b8")),
-        yaxis=dict(title="Wellhead Pressure  Pwh  (psia)", color="#94a3b8",
-                   gridcolor="#1e293b", zerolinecolor="#334155", title_font=dict(color="#94a3b8")),
-        paper_bgcolor="#0d1117", plot_bgcolor="#070b13",
-        legend=dict(font=dict(color="#94a3b8"), bgcolor="#0d1117",
-                    bordercolor="#1e293b", borderwidth=1),
-        hovermode="closest", height=460
+
+    # Layout
+    fig.update_layout(
+        title=dict(
+            text="<b>Well Performance Curves — IPR vs TPR</b>",
+            font=dict(color="#f8fafc", size=16)
+        ),
+        xaxis=dict(
+            title="Liquid Flow Rate  q  (STB/d)",
+            color="#94a3b8",
+            gridcolor="#1e293b",
+            zerolinecolor="#334155",
+            title_font=dict(color="#94a3b8")
+        ),
+        yaxis=dict(
+            title="Flowing BHP  Pwf  (psia)",
+            color="#94a3b8",
+            gridcolor="#1e293b",
+            zerolinecolor="#334155",
+            title_font=dict(color="#94a3b8")
+        ),
+        paper_bgcolor="#0d1117",
+        plot_bgcolor="#070b13",
+        legend=dict(
+            font=dict(color="#94a3b8"),
+            bgcolor="#0d1117",
+            bordercolor="#1e293b",
+            borderwidth=1
+        ),
+        hovermode="x unified",
+        height=480
     )
-    st.plotly_chart(figc, use_container_width=True)
-    st.caption("Gilbert's correlation assumes **critical (sonic) flow** across the bean — valid when "
-               "downstream pressure is below ≈ 0.5–0.7 × wellhead pressure. Larger beans pass more rate "
-               "at lower wellhead pressure.")
 
-# ── Equations Reference ────────────────────────────────────────
+    st.plotly_chart(fig, width="stretch")
 
-st.divider()
-st.markdown("### ∑ Governing Equations")
+    # ── Surface Choke / Wellhead-Node Analysis (Gilbert) ───────────
 
-e1, e2, e3 = st.columns(3)
+    if enable_choke:
+        st.divider()
+        st.markdown("### 🎚 Wellhead-Node Analysis — Gilbert Choke")
 
-with e1:
-    st.markdown("**Vogel IPR (1968)**")
-    st.latex(r"\frac{q}{q_{max}} = 1 - 0.2\left(\frac{P_{wf}}{P_r}\right) - 0.8\left(\frac{P_{wf}}{P_r}\right)^2")
-    st.markdown("**Composite IPR** *(linear above $P_b$, Vogel below)*")
-    st.latex(r"q = J(P_r - P_b) + \frac{J\,P_b}{1.8}\left[1 - 0.2\tfrac{P_{wf}}{P_b} - 0.8\left(\tfrac{P_{wf}}{P_b}\right)^2\right]")
-    st.markdown("**Linear IPR (Darcy)**")
-    st.latex(r"q = J \times (P_r - P_{wf})")
+        # GLR (Mscf/STB) from solution GOR and water cut
+        GLR_Mscf = (1 - WC) * GOR / 1000.0
 
-with e2:
-    st.markdown("**TPR — Hydrostatic**")
-    st.latex(r"\Delta P_{hyd} = \frac{\rho_{slip} \cdot H}{144} \quad \text{[psi]}")
-    st.markdown("**TPR — Friction (Darcy-Weisbach)**")
-    st.latex(r"\Delta P_f = \frac{f \cdot \rho_{ns} \cdot v^2 \cdot H}{2 \cdot g_c \cdot d \cdot 144} \quad \text{[psi]}")
-    st.markdown("**Friction factor (Swamee-Jain)**")
-    st.latex(r"f = \frac{0.25}{\left[\log_{10}\!\left(\frac{\varepsilon/d}{3.7} + \frac{5.74}{Re^{0.9}}\right)\right]^2}")
+        # Available wellhead pressure from reservoir through tubing:
+        #   Pwh_avail(q) = Pwf_IPR(q) − ΔP_tubing(q),   ΔP_tubing = TPR(q) − Pwh
+        dP_tubing = tpr_arr - Pwh
+        pwh_avail = np.maximum(0, ipr_arr - dP_tubing)
 
-with e3:
-    st.markdown("**Gilbert Choke (1954)**")
-    st.latex(r"P_{wh} = \frac{435 \cdot R^{0.546} \cdot q_L}{S^{1.89}} \quad \text{[psi]}")
-    st.markdown("**Gas FVF**")
-    st.latex(r"B_g = \frac{0.00504 \cdot z \cdot T}{P} \quad \text{[res bbl/scf]}")
-    st.markdown("**z-factor (Papay, 1985)**")
-    st.latex(r"z = 1 - \frac{3.52 \, P_{pr}}{10^{0.9813 T_{pr}}} + \frac{0.274 \, P_{pr}^2}{10^{0.8157 T_{pr}}}")
+        # Choke demand for the selected bean
+        pwh_sel = gilbert_choke_pwh(q_arr, GLR_Mscf, choke_S)
+        ck_q, ck_pwh = find_wellhead_point(q_arr, pwh_avail, pwh_sel)
 
-st.divider()
-st.caption("TPR uses a simplified multiphase column — velocity-dependent liquid holdup (slip) for the "
-           "hydrostatic head and Swamee-Jain friction. For rigorous design, apply Hagedorn-Brown or "
-           "Beggs-Brill correlations. | SETP 3513 · UTM")
+        # Result cards
+        k1, k2, k3 = st.columns(3)
+        with k1:
+            if ck_q:
+                st.metric("Choked Operating Rate", f"{int(round(ck_q)):,} STB/d",
+                          help="Where available wellhead pressure meets the Gilbert choke demand.")
+            else:
+                st.metric("Choked Operating Rate", "No Intersection")
+        with k2:
+            st.metric("Wellhead Pressure", f"{int(round(ck_pwh)):,} psia" if ck_pwh else "—")
+        with k3:
+            st.metric("Bean Size", f"{int(choke_S)}/64 in",
+                      help=f"GLR used: {GLR_Mscf:.3f} Mscf/STB")
+
+        # Chart: available-Pwh curve + choke family + selected bean + op point
+        figc = go.Figure()
+        figc.add_trace(go.Scatter(
+            x=q_arr, y=pwh_avail, mode="lines", name="Available Pwh (tubing)",
+            line=dict(color="#a78bfa", width=3),
+            hovertemplate="q = %{x:.0f} STB/d<br>Pwh = %{y:.0f} psia<extra>Available</extra>"
+        ))
+        bean_family = [16, 24, 32, 48, 64]
+        for S in bean_family:
+            if S == int(choke_S):
+                continue
+            figc.add_trace(go.Scatter(
+                x=q_arr, y=gilbert_choke_pwh(q_arr, GLR_Mscf, S),
+                mode="lines", name=f"{S}/64 in",
+                line=dict(color="#475569", width=1.3, dash="dot"),
+                hovertemplate=f"Bean {S}/64<br>"+"q = %{x:.0f}<br>Pwh = %{y:.0f} psia<extra></extra>"
+            ))
+        figc.add_trace(go.Scatter(
+            x=q_arr, y=pwh_sel, mode="lines", name=f"Choke {int(choke_S)}/64 in (selected)",
+            line=dict(color="#f59e0b", width=3),
+            hovertemplate=f"Bean {int(choke_S)}/64<br>"+"q = %{x:.0f}<br>Pwh = %{y:.0f} psia<extra>Choke</extra>"
+        ))
+        if ck_q and ck_pwh:
+            figc.add_trace(go.Scatter(
+                x=[ck_q], y=[ck_pwh], mode="markers+text", name="Choked Operating Point",
+                marker=dict(color="#4ade80", size=14, line=dict(color="#16a34a", width=2)),
+                text=[f"  ({int(round(ck_q)):,} STB/d, {int(round(ck_pwh)):,} psia)"],
+                textposition="middle right", textfont=dict(color="#4ade80", size=11),
+                hoverinfo="skip"
+            ))
+        figc.update_layout(
+            title=dict(text="<b>Available Wellhead Pressure vs Gilbert Choke Demand</b>",
+                       font=dict(color="#f8fafc", size=15)),
+            xaxis=dict(title="Liquid Flow Rate  q  (STB/d)", color="#94a3b8",
+                       gridcolor="#1e293b", zerolinecolor="#334155", title_font=dict(color="#94a3b8")),
+            yaxis=dict(title="Wellhead Pressure  Pwh  (psia)", color="#94a3b8",
+                       gridcolor="#1e293b", zerolinecolor="#334155", title_font=dict(color="#94a3b8")),
+            paper_bgcolor="#0d1117", plot_bgcolor="#070b13",
+            legend=dict(font=dict(color="#94a3b8"), bgcolor="#0d1117",
+                        bordercolor="#1e293b", borderwidth=1),
+            hovermode="closest", height=460
+        )
+        st.plotly_chart(figc, width="stretch")
+        st.caption("Gilbert's correlation assumes **critical (sonic) flow** across the bean — valid when "
+                   "downstream pressure is below ≈ 0.5–0.7 × wellhead pressure. Larger beans pass more rate "
+                   "at lower wellhead pressure.")
+
+    # ── Equations Reference ────────────────────────────────────────
+
+    st.divider()
+    st.markdown("### ∑ Governing Equations")
+
+    e1, e2, e3 = st.columns(3)
+
+    with e1:
+        st.markdown("**Vogel IPR (1968)**")
+        st.latex(r"\frac{q}{q_{max}} = 1 - 0.2\left(\frac{P_{wf}}{P_r}\right) - 0.8\left(\frac{P_{wf}}{P_r}\right)^2")
+        st.markdown("**Composite IPR** *(linear above $P_b$, Vogel below)*")
+        st.latex(r"q = J(P_r - P_b) + \frac{J\,P_b}{1.8}\left[1 - 0.2\tfrac{P_{wf}}{P_b} - 0.8\left(\tfrac{P_{wf}}{P_b}\right)^2\right]")
+        st.markdown("**Linear IPR (Darcy)**")
+        st.latex(r"q = J \times (P_r - P_{wf})")
+
+    with e2:
+        st.markdown("**TPR — Hydrostatic**")
+        st.latex(r"\Delta P_{hyd} = \frac{\rho_{slip} \cdot H}{144} \quad \text{[psi]}")
+        st.markdown("**TPR — Friction (Darcy-Weisbach)**")
+        st.latex(r"\Delta P_f = \frac{f \cdot \rho_{ns} \cdot v^2 \cdot H}{2 \cdot g_c \cdot d \cdot 144} \quad \text{[psi]}")
+        st.markdown("**Friction factor (Swamee-Jain)**")
+        st.latex(r"f = \frac{0.25}{\left[\log_{10}\!\left(\frac{\varepsilon/d}{3.7} + \frac{5.74}{Re^{0.9}}\right)\right]^2}")
+
+    with e3:
+        st.markdown("**Gilbert Choke (1954)**")
+        st.latex(r"P_{wh} = \frac{435 \cdot R^{0.546} \cdot q_L}{S^{1.89}} \quad \text{[psi]}")
+        st.markdown("**Gas FVF**")
+        st.latex(r"B_g = \frac{0.00504 \cdot z \cdot T}{P} \quad \text{[res bbl/scf]}")
+        st.markdown("**z-factor (Papay, 1985)**")
+        st.latex(r"z = 1 - \frac{3.52 \, P_{pr}}{10^{0.9813 T_{pr}}} + \frac{0.274 \, P_{pr}^2}{10^{0.8157 T_{pr}}}")
+
+    st.divider()
+    st.caption("TPR uses a simplified multiphase column — velocity-dependent liquid holdup (slip) for the "
+               "hydrostatic head and Swamee-Jain friction. For rigorous design, apply Hagedorn-Brown or "
+               "Beggs-Brill correlations. | SETP 3513 · UTM")
+
+
+
+with tab2:
+    import plotly.graph_objects as go
+
+    st.markdown("### Vertical Lift Performance — Gilbert pressure-traverse method")
+    st.caption("VLP curves built by integrating the multiphase pressure gradient "
+               "(Beggs-Brill holdup · Jain friction) along the tubing — the "
+               "computational form of reading the Gilbert pressure-distribution "
+               "curve by equivalent depth.")
+
+    vlp_method = st.radio(
+        "Method",
+        ["Method 1 — P_wf vs q (THP → P_wf)",
+         "Method 2 — THP vs q (P_wf → THP)",
+         "Both"],
+        index=2, horizontal=True,
+        help="Method 1: fix THP, march down for P_wf. "
+             "Method 2: take P_wf from IPR, march up for THP.",
+    )
+
+    try:
+        qg_vlp = np.linspace(max(qmax * 0.02, 10.0), qmax, 35)
+        ipr_g  = np.interp(qg_vlp, q_arr, ipr_arr)
+
+        # Method 1 — required P_wf (outflow) for fixed THP
+        pwf_vlp = np.array([integrate_traverse(Pwh, q, vp, +1, 60) for q in qg_vlp])
+        d1 = ipr_g - pwf_vlp
+        op1_q = op1_pwf = None
+        for i in range(len(d1) - 1):
+            if d1[i] > 0 and d1[i + 1] <= 0:
+                fr = d1[i] / (d1[i] - d1[i + 1])
+                op1_q   = qg_vlp[i] + fr * (qg_vlp[i + 1] - qg_vlp[i])
+                op1_pwf = ipr_g[i]  + fr * (ipr_g[i + 1]  - ipr_g[i])
+                break
+
+        # Method 2 — required THP from IPR P_wf, operating where THP = THP_set
+        thp_vlp = np.array([integrate_traverse(max(ipr_g[i], 20.0), qg_vlp[i], vp, -1, 60)
+                            for i in range(len(qg_vlp))])
+        d2 = thp_vlp - Pwh
+        op2_q = op2_pwf = None
+        for i in range(len(d2) - 1):
+            if d2[i] * d2[i + 1] < 0:
+                fr = d2[i] / (d2[i] - d2[i + 1])
+                op2_q   = qg_vlp[i] + fr * (qg_vlp[i + 1] - qg_vlp[i])
+                op2_pwf = ipr_g[i]  + fr * (ipr_g[i + 1]  - ipr_g[i])
+                break
+
+        # ---- metrics ----
+        m1, m2, m3 = st.columns(3)
+        with m1:
+            st.metric("Operating rate (M1)",
+                      f"{op1_q:,.0f} STB/d" if op1_q else "No flow")
+        with m2:
+            st.metric("Operating P_wf (M1)",
+                      f"{op1_pwf:,.0f} psia" if op1_pwf else "—")
+        with m3:
+            st.metric("Operating rate (M2)",
+                      f"{op2_q:,.0f} STB/d" if op2_q else "No flow")
+
+        # ---- Method 1 plot ----
+        if vlp_method.startswith("Method 1") or vlp_method == "Both":
+            f1 = go.Figure()
+            f1.add_trace(go.Scatter(x=q_arr, y=ipr_arr, name="IPR (inflow)",
+                                    line=dict(color="#f5a623", width=3)))
+            f1.add_trace(go.Scatter(x=qg_vlp, y=pwf_vlp, name="VLP — Method 1 (P_wf vs q)",
+                                    line=dict(color="#3ec1a8", width=3)))
+            if op1_q:
+                f1.add_trace(go.Scatter(x=[op1_q], y=[op1_pwf], mode="markers+text",
+                                        marker=dict(color="#e8743b", size=13,
+                                                    line=dict(color="#fff", width=1.5)),
+                                        text=["  operating point"], textposition="middle right",
+                                        textfont=dict(color="#e8743b"), name="Operating point"))
+            f1.update_layout(template="plotly_dark", height=430,
+                             title="Method 1 — P_wf vs q  (IPR ∩ VLP)",
+                             xaxis_title="Flow rate, q (STB/d)",
+                             yaxis_title="P_wf (psia)",
+                             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                             legend=dict(orientation="h", y=1.12))
+            st.plotly_chart(f1, width="stretch")
+
+        # ---- Method 2 plot ----
+        if vlp_method.startswith("Method 2") or vlp_method == "Both":
+            f2 = go.Figure()
+            f2.add_trace(go.Scatter(x=qg_vlp, y=thp_vlp, name="VLP — Method 2 (THP vs q)",
+                                    line=dict(color="#3ec1a8", width=3)))
+            f2.add_hline(y=Pwh, line=dict(color="#f5a623", width=2, dash="dash"),
+                         annotation_text=f"Available THP = {Pwh:.0f} psia",
+                         annotation_position="top left")
+            if op2_q:
+                f2.add_trace(go.Scatter(x=[op2_q], y=[Pwh], mode="markers+text",
+                                        marker=dict(color="#e8743b", size=13,
+                                                    line=dict(color="#fff", width=1.5)),
+                                        text=["  q at available THP"], textposition="middle right",
+                                        textfont=dict(color="#e8743b"), name="Operating q"))
+            f2.update_layout(template="plotly_dark", height=430,
+                             title="Method 2 — THP vs q  (operating where THP = available THP)",
+                             xaxis_title="Flow rate, q (STB/d)",
+                             yaxis_title="THP / P_wh (psia)",
+                             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                             legend=dict(orientation="h", y=1.12))
+            st.plotly_chart(f2, width="stretch")
+
+        # ---- Gilbert pressure-traverse (gradient) curve ----
+        st.markdown("#### Gilbert pressure-traverse curve")
+        q_show = op1_q if op1_q else qg_vlp[len(qg_vlp) // 2]
+        depths, pres = integrate_traverse(Pwh, q_show, vp, +1, 80, record=True)
+        ft = go.Figure()
+        ft.add_trace(go.Scatter(x=pres, y=depths, mode="lines",
+                                line=dict(color="#ffcd6b", width=3), name="Pressure traverse"))
+        ft.update_layout(template="plotly_dark", height=430,
+                         title=f"Pressure vs depth at q = {q_show:,.0f} STB/d "
+                               f"(GLR-consistent, d = {d_in}\")",
+                         xaxis_title="Pressure (psia)",
+                         yaxis_title="Depth (ft)",
+                         yaxis=dict(autorange="reversed"),
+                         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                         showlegend=False)
+        st.plotly_chart(ft, width="stretch")
+        st.caption(f"THP = {Pwh:.0f} psia at surface → P_wf = {pres[-1]:,.0f} psia at "
+                   f"{vp['depth']:,.0f} ft. Curve steepens with depth as the gas "
+                   "compresses and the column grows heavier — the same shape as Gilbert's "
+                   "field gradient curves.")
+
+    except Exception as e:
+        st.error(f"VLP calculation error: {e}")
